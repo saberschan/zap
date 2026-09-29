@@ -1,12 +1,20 @@
-# Linux x86_64 RPM 精简打包流水线。
+# Linux x86_64 精简打包流水线(RPM + CLI tarball + GitHub Release)。
 #
-# 与 zap_release.yml(全平台 tag 发布)的差异:本 workflow 只做一件事 ——
-# 在 ubuntu-22.04 上编译 release-lto 二进制并打出 linux x64 RPM 包,
-# 上传为 workflow artifact。不构建 macOS / Windows / AppImage / deb / Arch / CLI,
-# 不创建 GitHub Release;push 到 main 或手动 dispatch 即触发。
+# 与 zap_release.yml(全平台 tag 发布)的差异:本 workflow 只做 linux x64 ——
+# 在 ubuntu-22.04 上编译 release-lto GUI 并打出 RPM 包,再用 musl 静态编译
+# CLI 打成 `zap-linux-x86_64.tar.gz`,最后创建 GitHub Release(tag = 构建版本)
+# 并把两个产物都挂上去。不构建 macOS / Windows / AppImage / deb / Arch。
 #
-# 版本号用 `v0.<构建时间>`:build.rs 与 bundle_rpm 都从 GIT_RELEASE_TAG 取版本
-# (`v` 前缀会被剥掉),日期时间格式保证跨构建单调递增,RPM 可直接升级安装。
+# 为什么必须发 Release:SSH 远程服务器(SSH Remote)的安装脚本会让远端机器从
+# `github.com/zerx-lab/warp/releases/download/<GIT_RELEASE_TAG>/zap-linux-x86_64.tar.gz`
+# 下载 remote-server CLI(版本号按应用版本钉死,见
+# `remote_server::setup::install_script`)。本地构建的版本若没有对应 Release,
+# 远程连接会报 "install script failed"(404)。因此本流水线每个构建都会发
+# 一个同名 tag 的 Release。
+#
+# 版本号用 `v<构建时间>`(如 v2026.09.29.1147):build.rs / bundle_rpm 从
+# GIT_RELEASE_TAG 取版本(剥掉 v 前缀),日期时间格式保证跨构建单调递增,
+# 且与已发布版本(2026.07.09.1 等)同命名空间可比,dnf upgrade 正常识别。
 
 name: Linux x64 RPM
 
@@ -16,8 +24,9 @@ on:
       - main
   workflow_dispatch:
 
+# 创建 Release + 上传资产需要写权限。
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,7 +44,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       # GitHub-hosted ubuntu runner 预装工具链占用大量磁盘;release-lto 全量构建
-      # + 依赖编译会逼近磁盘上限,先删掉与本构建无关的工具腾出 ~25GB
+      # + musl CLI 构建会逼近磁盘上限,先删掉与本构建无关的工具腾出 ~25GB
       # (与 zap_release.yml 的 release_linux job 相同处理)。
       - name: Free up disk space
         shell: bash
@@ -65,10 +74,6 @@ jobs:
       - name: Compute build version tag
         id: version
         shell: bash
-        # 版本形如 v2026.09.29.1147:剥掉 v 后的 2026.09.29.1147 与已发布版本
-        # (如 2026.07.09.1)同一命名空间,rpmvercmp 比较始终更新,`dnf upgrade`
-        # 能直接识别为升级;若带前导 0(如 v0.2026...)会被 dnf 判为旧版本,
-        # 安装时显示"降级"且 `dnf upgrade` 直接跳过。
         run: echo "tag=v$(date +%Y.%m.%d.%H%M)" >> "$GITHUB_OUTPUT"
 
       # 一步完成编译 + 打包:cargo build (release-lto) → strip → staging → rpmbuild。
@@ -86,3 +91,70 @@ jobs:
           path: target/release-lto/bundle/linux/*.rpm
           if-no-files-found: error
           retention-days: 14
+
+      # RPM 拷到稳定路径:下面的 musl CLI 构建会删除 target/release-lto。
+      - name: Stash RPM for release
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release-lto/bundle/linux/*.rpm dist/
+          ls -lh dist
+
+      # release-lto 产物已打包为 RPM/artifact,本地不再需要;删除给 musl CLI
+      # 构建腾磁盘(与 zap_release.yml 的 release_linux job 相同处理)。
+      - name: Reclaim disk before musl CLI build
+        shell: bash
+        run: |
+          rm -rf target/release-lto
+          df -h /
+
+      # CLI/remote-server tarball 用静态 musl 链接,产物不依赖宿主 glibc,
+      # 远端服务器(旧 glibc 的 CentOS/Debian 等)可直接运行。
+      # zig 自带完整 musl 交叉工具链,不依赖宿主 musl-gcc。
+      - name: Install zig + cargo-zigbuild for static musl CLI build
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          ZIG_VERSION="0.13.0"
+          ZIG_DIR="$HOME/.local/zig-${ZIG_VERSION}"
+          if [ ! -x "${ZIG_DIR}/zig" ]; then
+            mkdir -p "${ZIG_DIR}"
+            curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+              | tar -xJ -C "${ZIG_DIR}" --strip-components=1
+          fi
+          echo "${ZIG_DIR}" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild --version ^0.19
+        shell: bash
+
+      - name: Build CLI (static musl via zigbuild)
+        id: bundle_cli
+        run: |
+          script/bundle --channel "$CHANNEL" --arch x86_64 --artifact cli --packages none \
+            --target x86_64-unknown-linux-musl
+        shell: bash
+        env:
+          GIT_RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          USE_ZIGBUILD: "true"
+          PKG_CONFIG_ALLOW_CROSS: 1
+
+      - name: Package CLI tarball
+        run: |
+          cp "${{ steps.bundle_cli.outputs.executable_path }}" zap-oss
+          tar czf zap-linux-x86_64.tar.gz \
+            zap-oss \
+            -C "$(dirname "${{ steps.bundle_cli.outputs.bundled_resources_dir }}")" resources
+        shell: bash
+
+      # Release 的 tag 必须与 GIT_RELEASE_TAG 完全一致:SSH 远程安装脚本按
+      # `releases/download/<tag>/zap-linux-x86_64.tar.gz` 下载。
+      - name: Create GitHub release with CLI tarball and RPM
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          draft: false
+          prerelease: false
+    files: |
+      zap-linux-x86_64.tar.gz
+      dist/*.rpm
