@@ -568,6 +568,7 @@ struct SerializerProjectionBuilder {
     pending_tool_calls: Vec<ProjectedToolCall>,
     pending_task_id: Option<String>,
     pending_assistant_message_id: Option<String>,
+    pending_tool_results: Vec<ProjectedToolResult>,
     skipped_tool_results: HashSet<(String, String)>,
 }
 
@@ -578,6 +579,7 @@ impl SerializerProjectionBuilder {
             pending_tool_calls: Vec::new(),
             pending_task_id: None,
             pending_assistant_message_id: None,
+            pending_tool_results: Vec::new(),
             skipped_tool_results: HashSet::new(),
         }
     }
@@ -634,8 +636,18 @@ impl SerializerProjectionBuilder {
     }
 
     fn push_tool_result(&mut self, result: ProjectedToolResult) {
-        self.flush_tool_calls();
-        self.items.push(ProjectionItem::tool_result(result));
+        // 分组尚未关闭(同轮还有挂起的 tool call)时,结果先缓冲,等 flush 时
+        // 紧跟在分组之后按到达顺序发出。并行工具调用下,快工具的 ToolCallResult
+        // 会插在慢工具的 ToolCall 消息之间落库;若在这里立即 flush,会把同一轮
+        // 的调用劈成多个分组,晚到的结果落在后一个分组的窗口里推断不出所属
+        // assistant message,被 readiness 误判 OutOfOrderToolResult 永久阻断
+        // (多工具调用轮必现的对话卡死 bug)。
+        // 分组已关闭后才到的结果仍立即发出,真正的跨轮乱序依旧照常阻断。
+        if self.pending_tool_calls.is_empty() {
+            self.items.push(ProjectionItem::tool_result(result));
+            return;
+        }
+        self.pending_tool_results.push(result);
     }
 
     fn should_skip_tool_result(&self, task_id: &str, tool_call_id: &str) -> bool {
@@ -660,6 +672,9 @@ impl SerializerProjectionBuilder {
             assistant_message_id,
             std::mem::take(&mut self.pending_tool_calls),
         ));
+        for result in std::mem::take(&mut self.pending_tool_results) {
+            self.items.push(ProjectionItem::tool_result(result));
+        }
     }
 }
 
@@ -1661,6 +1676,10 @@ fn build_chat_request(
         }
     }
 
+    // 普通流程也把交错的 tool response 重排到所属分组之后(严格 provider 的
+    // tool-follows-assistant 校验需要);已有序时零改动。
+    rebundle_tool_responses_for_provider_ordering(&mut messages, &outbound_tool_groups);
+
     if let ReadinessState::AcceptedHistoryRepair { repairs } = &readiness_report.state {
         repair_tool_call_pairs_for_accepted_history_gaps(
             &mut messages,
@@ -2159,6 +2178,128 @@ fn apply_caching_anthropic(messages: &mut Vec<ChatMessage>) {
             }
         })
         .collect();
+}
+
+/// 普通流程的出站顺序修复:并行工具调用下,同轮各工具的结果在历史里可能交错
+/// (快工具的 ToolCallResult 落在慢工具的 ToolCall 消息之后),出站的
+/// assistant tool_use 消息与 role=tool 响应消息因此不相邻,甚至跟随在
+/// 后一分组的 assistant 消息之后。OpenAI 系严格校验要求 tool response 紧跟
+/// 对应的 assistant tool_use 消息,否则 400。
+///
+/// 这里按 call_id 的全局唯一归属,把每个分组的 tool response 消息移动到该
+/// 分组的 assistant 消息之后(保持原有消息切分与内容,只移动位置,不合并、
+/// 不删改)。若全部响应已就位则原样返回,避免无谓改动 payload 打散 prompt
+/// cache;出现无法唯一归属(跨分组 / 重复 call_id)的响应消息时放弃重排,
+/// 交由既有链路处理。
+fn rebundle_tool_responses_for_provider_ordering(
+    messages: &mut Vec<ChatMessage>,
+    outbound_tool_groups: &[OutboundAssistantToolGroup],
+) {
+    use std::collections::{HashMap, HashSet};
+
+    if outbound_tool_groups.is_empty() || messages.is_empty() {
+        return;
+    }
+
+    // call_id → 分组的 assistant 消息下标;重复 call_id 不参与重排。
+    let mut call_to_group: HashMap<&str, usize> = HashMap::new();
+    let mut duplicate_call_ids: HashSet<&str> = HashSet::new();
+    for group in outbound_tool_groups {
+        for key in &group.tool_call_keys {
+            if call_to_group
+                .insert(key.tool_call_id.as_str(), group.message_index)
+                .is_some()
+            {
+                duplicate_call_ids.insert(key.tool_call_id.as_str());
+            }
+        }
+    }
+
+    // 快速路径检测:每条 tool 消息必须紧跟其分组的 assistant 消息(或同分组的
+    // 前一条 tool 消息),且响应 call_id 都属于当前分组。已满足则不动。
+    let group_message_indexes: HashSet<usize> = outbound_tool_groups
+        .iter()
+        .map(|group| group.message_index)
+        .collect();
+    let mut current_group_index: Option<usize> = None;
+    let mut mis_ordered = false;
+    for (idx, msg) in messages.iter().enumerate() {
+        if group_message_indexes.contains(&idx) {
+            current_group_index = Some(idx);
+            continue;
+        }
+        if msg.role == genai::chat::ChatRole::Tool {
+            let belongs_here = current_group_index.is_some()
+                && msg.content.tool_responses().iter().all(|response| {
+                    call_to_group.get(response.call_id.as_str())
+                        == Some(&current_group_index.expect("checked is_some above"))
+                });
+            if !belongs_here {
+                mis_ordered = true;
+                break;
+            }
+        } else {
+            current_group_index = None;
+        }
+    }
+    if !mis_ordered {
+        return;
+    }
+
+    // 按分组收集响应(以 call_id 归一;重复 call_id 已在上面放弃重排)。
+    let mut response_by_call_id: HashMap<String, ToolResponse> = HashMap::new();
+    for msg in messages.iter() {
+        if msg.role != genai::chat::ChatRole::Tool {
+            continue;
+        }
+        let call_ids: Vec<&str> = msg
+            .content
+            .tool_responses()
+            .iter()
+            .map(|response| response.call_id.as_str())
+            .collect();
+        let owning_groups: HashSet<usize> = call_ids
+            .iter()
+            .filter_map(|call_id| call_to_group.get(call_id).copied())
+            .collect();
+        if call_ids.is_empty()
+            || owning_groups.len() != 1
+            || call_ids
+                .iter()
+                .any(|call_id| duplicate_call_ids.contains(call_id))
+        {
+            log::warn!(
+                "[byop-diag] tool response rebundle: response message cannot be uniquely \
+                 attributed to one tool group, skipping rebundle"
+            );
+            return;
+        }
+        for response in msg.content.tool_responses() {
+            insert_preferred_tool_response(&mut response_by_call_id, response);
+        }
+    }
+
+    // 重放:非 tool 消息原样保留;分组 assistant 消息之后按该分组 tool_call_keys
+    // 的声明顺序逐条补发响应消息(与 messages loop 的单响应消息构造保持一致)。
+    let group_by_message_index: HashMap<usize, &OutboundAssistantToolGroup> = outbound_tool_groups
+        .iter()
+        .map(|group| (group.message_index, group))
+        .collect();
+    let mut rewritten: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role == genai::chat::ChatRole::Tool {
+            continue;
+        }
+        rewritten.push(msg.clone());
+        if let Some(group) = group_by_message_index.get(&idx) {
+            for key in &group.tool_call_keys {
+                if let Some(response) = response_by_call_id.remove(&key.tool_call_id) {
+                    rewritten.push(ChatMessage::from(response));
+                }
+            }
+        }
+    }
+    *messages = rewritten;
 }
 
 /// 仅在 serializer 已判定为 `AcceptedHistoryRepair` 后运行:把被 RepairRecord
@@ -6481,6 +6622,73 @@ mod serializer_readiness_tests {
             "running second parallel call must be pending, got {:?}",
             report.state
         );
+    }
+
+    /// 生产现场回归(多工具调用轮卡死 bug 的真正主因):并行工具调用时,快工具的
+    /// 结果会插在慢工具的 ToolCall 消息之间落库——真实卡死会话的历史形态是
+    /// [call_a, call_b, result_b, call_c, result_c, result_a]。旧投影按"结果即
+    /// flush"把同轮调用劈成多个分组,result_a 落在最后一个分组的窗口里推断不出
+    /// 归属,readiness 判 OutOfOrderToolResult 永久阻断。修复后同轮调用合并进
+    /// 同一分组,必须 Ready,且出站请求体满足严格 tool-follows-assistant 顺序。
+    #[test]
+    fn interleaved_parallel_tool_results_are_ready_and_strict_ordered() {
+        let user_message = make_user_query_message("task-1", "req-1", "hi".to_owned(), &[]);
+        let tool_call_message_a = make_tool_call_message("task-1", "req-1", "call-1", shell_tool());
+        let tool_call_message_b = make_tool_call_message("task-1", "req-1", "call-2", shell_tool());
+        let tool_result_message_b = make_tool_call_result_message(
+            "task-1",
+            "req-1",
+            "call-2".to_owned(),
+            r#"{"status":"completed"}"#.to_owned(),
+        );
+        let tool_call_message_c = make_tool_call_message("task-1", "req-1", "call-3", shell_tool());
+        let tool_result_message_c = make_tool_call_result_message(
+            "task-1",
+            "req-1",
+            "call-3".to_owned(),
+            r#"{"status":"completed"}"#.to_owned(),
+        );
+        let tool_result_message_a = make_tool_call_result_message(
+            "task-1",
+            "req-1",
+            "call-1".to_owned(),
+            r#"{"status":"completed"}"#.to_owned(),
+        );
+
+        let params = request_params(
+            vec![
+                user_message,
+                tool_call_message_a,
+                tool_call_message_b,
+                tool_result_message_b,
+                tool_call_message_c,
+                tool_result_message_c,
+                tool_result_message_a,
+            ],
+            vec![user_query_input("continue")],
+        );
+
+        let report = classify_byop_controller_readiness(&params);
+        assert!(
+            matches!(report.state, ReadinessState::Ready),
+            "interleaved parallel results of one turn must be ready, got {:?}",
+            report.state
+        );
+
+        let request =
+            build_openai_request(&params).expect("interleaved parallel results should serialize");
+        let errors = strict_chat_completions_ordering_errors(&request.messages);
+        assert!(
+            errors.is_empty(),
+            "request body ordering errors: {errors:?}"
+        );
+
+        // 每个工具调用都恰好拿到一条响应,且全部紧跟在所属 assistant 分组之后
+        // (rebundle 把交错响应移动到分组后面)。
+        for call_id in ["call-1", "call-2", "call-3"] {
+            let contents = tool_response_contents(&request, call_id);
+            assert_eq!(contents.len(), 1, "call {call_id} must have one response");
+        }
     }
 
     #[test]
