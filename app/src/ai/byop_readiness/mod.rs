@@ -1209,10 +1209,19 @@ impl<'a> Classifier<'a> {
     }
 
     fn live_call_for_key(&self, key: &ToolCallKey) -> Option<&LiveToolCall> {
-        self.context
-            .live_tool_calls
-            .iter()
-            .find(|live_call| &live_call.tool_call.key == key)
+        // live 匹配必须按协议级身份 (task_id, tool_call_id) 对齐,不能做三元组全等:
+        // 持久化协议(AIAgentActionResult / ToolCallResult)与 action model 只携带该二元组,
+        // assistant_tool_call_message_id 是 projection 内部约定。SerializerProjectionBuilder
+        // 会把同一轮连续的多条 ToolCall message 合并进一个 group 并统一挂到首条 message id
+        // 上,而 controller 的 live tool call 生产者(byop_unfinished_live_tool_calls /
+        // cancellation_live_tool_calls)按每条 ToolCall message 自己的 id 建 key。若按三元组
+        // 全等匹配,同轮第 2+ 个并行 tool call 永远查不到 live 状态:正在运行或已请求取消的
+        // 调用被误判为"无解释缺失",controller 随即给仍在执行的调用合成假 cancellation,
+        // 真实结果回来后形成 DuplicateToolResults,对话被永久阻断(多工具调用轮必现)。
+        self.context.live_tool_calls.iter().find(|live_call| {
+            live_call.tool_call.key.task_id == key.task_id
+                && live_call.tool_call.key.tool_call_id == key.tool_call_id
+        })
     }
 
     fn repair_record_for_key(&self, key: &ToolCallKey) -> Option<(usize, &RepairRecord)> {

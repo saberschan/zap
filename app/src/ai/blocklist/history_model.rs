@@ -561,6 +561,24 @@ impl BlocklistAIHistoryModel {
             .map_err(UpdateHistoryError::from)
     }
 
+    /// 按 message id 删除 controller preflight 此前写入的合成 message(见
+    /// [`AIConversation::remove_byop_preflight_messages_by_ids`] 的调用方约束)。
+    pub fn remove_byop_preflight_messages_by_ids(
+        &mut self,
+        conversation_id: AIConversationId,
+        task_id: TaskId,
+        message_ids: HashSet<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<usize, UpdateHistoryError> {
+        let conversation = self
+            .conversations_by_id
+            .get_mut(&conversation_id)
+            .ok_or(UpdateHistoryError::ConversationNotFound(conversation_id))?;
+        conversation
+            .remove_byop_preflight_messages_by_ids(task_id, message_ids, ctx)
+            .map_err(UpdateHistoryError::from)
+    }
+
     pub fn restore_conversations(
         &mut self,
         terminal_view_id: EntityId,

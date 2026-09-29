@@ -39,6 +39,37 @@ fn persisted_result(message_id: &str, result_kind: TerminalResultKind) -> Projec
     ))
 }
 
+fn persisted_result_for_call(
+    message_id: &str,
+    assistant_message_id: &str,
+    tool_call_id: &str,
+    result_kind: TerminalResultKind,
+) -> ProjectionItem {
+    ProjectionItem::tool_result(ProjectedToolResult::new(
+        "task-1",
+        message_id,
+        Some(assistant_message_id.to_string()),
+        tool_call_id,
+        kind("shell"),
+        ToolResultSource::PersistedHistory,
+        result_kind,
+    ))
+}
+
+/// 模拟真实 BYOP 历史里"一轮多个并行 tool call"的投影形态:
+/// 每条 ToolCall 是独立 message(msg-1 / msg-2),但 projection 会把同一轮的
+/// 连续调用合并进一个 group 并统一挂到首条 message id(msg-1)上。
+fn two_parallel_calls_group() -> ProjectionItem {
+    ProjectionItem::assistant_tool_calls(
+        "task-1",
+        "msg-1",
+        vec![
+            call("task-1", "msg-1", "call-1"),
+            call("task-1", "msg-1", "call-2"),
+        ],
+    )
+}
+
 fn classify(items: Vec<ProjectionItem>) -> ReadinessReport {
     classify_projection(&items, &ReadinessContext::default())
 }
@@ -205,6 +236,100 @@ fn running_live_action_is_pending() {
         report.state,
         ReadinessState::PendingToolResults {
             tool_calls: vec![call_ref("task-1", "assistant-1", "call-1")],
+        }
+    );
+}
+
+#[test]
+fn multiple_parallel_calls_with_results_are_ready() {
+    let report = classify(vec![
+        two_parallel_calls_group(),
+        persisted_result_for_call("result-1", "msg-1", "call-1", TerminalResultKind::Real),
+        persisted_result_for_call("result-2", "msg-1", "call-2", TerminalResultKind::Real),
+    ]);
+
+    assert_eq!(report.state, ReadinessState::Ready);
+}
+
+/// 回归测试(多工具调用轮卡死 bug):同轮第 2+ 个并行 tool call 的 live key 由
+/// controller 按各自 ToolCall message id(msg-2)构建,而 projection 把整个 group
+/// 挂到首条 message id(msg-1)上。live 匹配必须按 (task_id, tool_call_id) 对齐,
+/// 否则正在运行的调用会被误判为 MissingResultWithoutRepairSource,进而被合成
+/// 假 cancellation,真实结果落地后触发 DuplicateToolResults 永久阻断。
+#[test]
+fn second_parallel_call_running_with_own_message_id_is_pending() {
+    let context = ReadinessContext {
+        repair_records: Vec::new(),
+        live_tool_calls: vec![
+            LiveToolCall::new(
+                call_ref("task-1", "msg-1", "call-1"),
+                LiveToolCallState::Running,
+            ),
+            LiveToolCall::new(
+                call_ref("task-1", "msg-2", "call-2"),
+                LiveToolCallState::Running,
+            ),
+        ],
+    };
+
+    let report = classify_projection(&[two_parallel_calls_group()], &context);
+
+    assert_eq!(
+        report.state,
+        ReadinessState::PendingToolResults {
+            tool_calls: vec![
+                call_ref("task-1", "msg-1", "call-1"),
+                call_ref("task-1", "msg-1", "call-2"),
+            ],
+        }
+    );
+}
+
+/// 同上:第 2 个并行调用已请求取消时,必须走 NeedsCancellationCommit(干净提交
+/// 真实 cancellation result),而不是被当作缺失结果合成占位。
+#[test]
+fn second_parallel_call_cancellation_requested_with_own_message_id_needs_commit() {
+    let report = classify_projection(
+        &[two_parallel_calls_group()],
+        &ReadinessContext {
+            repair_records: Vec::new(),
+            live_tool_calls: vec![LiveToolCall::new(
+                call_ref("task-1", "msg-2", "call-2"),
+                LiveToolCallState::CancellationRequested,
+            )],
+        },
+    );
+
+    assert_eq!(
+        report.state,
+        ReadinessState::NeedsCancellationCommit {
+            tool_calls: vec![call_ref("task-1", "msg-1", "call-2")],
+        }
+    );
+}
+
+/// 首个调用已有真实结果、第 2 个并行调用仍在运行(且其 live key 用各自 message id)
+/// 时,必须等待而不是阻断。
+#[test]
+fn first_parallel_call_satisfied_second_running_is_pending() {
+    let report = classify_projection(
+        &[
+            two_parallel_calls_group(),
+            persisted_result_for_call("result-1", "msg-1", "call-1", TerminalResultKind::Real),
+        ],
+        &ReadinessContext {
+            repair_records: Vec::new(),
+            live_tool_calls: vec![LiveToolCall::new(
+                call_ref("task-1", "msg-2", "call-2"),
+                LiveToolCallState::Running,
+            )],
+        },
+    );
+
+    assert_eq!(
+        report.state,
+        ReadinessState::PendingToolResults {
+            tool_calls: vec![call_ref("task-1", "msg-1", "call-2")],
         }
     );
 }

@@ -1566,6 +1566,56 @@ impl AIConversation {
         Ok(message_count)
     }
 
+    /// 按 message id 删除此前由 controller preflight 写入的合成 message(目前只有
+    /// `byop_synthetic_cancellation_message` 合成的 cancellation 占位 ToolCallResult)。
+    ///
+    /// 仅供 BYOP readiness 自愈路径使用:调用方(controller)必须先用 payload 精确校验
+    /// 目标 message 确为本模块合成的占位,绝不能传入用户 / 模型产出的内容。
+    /// 与 `append_byop_preflight_messages_to_task` 相同,先改内存再持久化,
+    /// 持久化失败时把删除的 message 原样回滚。返回实际删除的条数。
+    pub fn remove_byop_preflight_messages_by_ids(
+        &mut self,
+        task_id: TaskId,
+        message_ids: HashSet<String>,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<usize, UpdateConversationError> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_can_persist_byop_preflight_state(ctx)?;
+
+        let mut removed_messages: Vec<api::Message> = Vec::new();
+        self.task_store
+            .modify_task(&task_id, |task| {
+                removed_messages.extend(
+                    task.messages()
+                        .filter(|message| message_ids.contains(&message.id))
+                        .cloned(),
+                );
+                task.remove_source_messages_by_ids(&message_ids)
+            })
+            .ok_or(UpdateConversationError::TaskNotFound)??;
+        if let Err(e) = self.send_updated_conversation_state_for_byop_preflight(ctx) {
+            if let Some(rollback_result) = self.task_store.modify_task(&task_id, |task| {
+                task.append_source_messages(removed_messages.clone())
+            }) {
+                if let Err(rollback_error) = rollback_result {
+                    log::error!(
+                        "[byop-readiness] failed to roll back removed preflight messages after \
+                         persistence error: {rollback_error:?}"
+                    );
+                }
+            } else {
+                log::error!(
+                    "[byop-readiness] failed to find task while rolling back removed preflight \
+                     messages"
+                );
+            }
+            return Err(e);
+        }
+        Ok(removed_messages.len())
+    }
+
     pub fn append_reassigned_exchange(
         &mut self,
         response_stream_id: &ResponseStreamId,

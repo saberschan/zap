@@ -35,7 +35,7 @@ use crate::ai::api_error::AIApiError;
 use crate::ai::byop_readiness::{
     BlockedByopReadinessError, PendingByopToolResultsError, ReadinessCategory,
     ReadinessDiagnosticCoalescer, ReadinessDiagnosticContext, ReadinessDiagnosticLevel,
-    ReadinessTriggerLayer, BLOCKED_BYOP_REQUEST_MESSAGE,
+    ReadinessTriggerLayer, ToolResultSource, BLOCKED_BYOP_REQUEST_MESSAGE,
 };
 use crate::ai::document::ai_document_model::{
     AIDocumentId, AIDocumentModel, AIDocumentUserEditStatus,
@@ -2244,10 +2244,69 @@ impl BlocklistAIController {
                     )?;
                     request_params.byop_readiness_attempt_id = Some(readiness_attempt_id.clone());
                 }
-                state @ (crate::ai::byop_readiness::ReadinessState::DuplicateToolResults {
-                    ..
+                crate::ai::byop_readiness::ReadinessState::DuplicateToolResults {
+                    tool_call,
+                    results,
+                } => {
+                    // 旧版 bug(并行 tool call 的 live key 三元组不匹配)会给同一
+                    // tool_call_id 留下"preflight 合成占位 + 真实结果"两条记录,
+                    // readiness 判 DuplicateToolResults 后永久阻断、对话报废。
+                    // 这里做精确自愈:仅当重复结果中存在可精确识别的 preflight 合成
+                    // 占位、且至少还有一条真实持久化结果时,删除占位并重跑 readiness,
+                    // 让被旧 bug 卡死的对话解卡;其余重复形态仍按损坏历史阻断。
+                    let healed = self.remove_byop_synthetic_duplicate_result(
+                        conversation_data.id,
+                        &tool_call.key,
+                        &results,
+                        ctx,
+                    )?;
+                    let diagnostic_context = ReadinessDiagnosticContext::new(
+                        &conversation_id_for_log,
+                        &readiness_attempt_id,
+                        ReadinessTriggerLayer::ControllerPreflight,
+                    )
+                    .with_iteration(iteration);
+                    if healed > 0 {
+                        log::info!(
+                            "[byop-readiness] healed synthetic duplicate tool result \
+                             tool_call_id={} removed={healed} iteration={iteration} \
+                             conversation_id={conversation_id_for_log}",
+                            tool_call.key.tool_call_id
+                        );
+                        self.rebuild_request_after_byop_preflight(
+                            request_input,
+                            conversation_data,
+                            request_params,
+                            query_metadata.clone(),
+                            ctx,
+                        )?;
+                        request_params.byop_readiness_attempt_id =
+                            Some(readiness_attempt_id.clone());
+                        continue;
+                    }
+                    diagnostics.log_state(
+                        &crate::ai::byop_readiness::ReadinessState::DuplicateToolResults {
+                            tool_call,
+                            results,
+                        },
+                        &diagnostic_context,
+                        ReadinessDiagnosticLevel::Error,
+                    );
+                    diagnostics.finish(&diagnostic_context, ReadinessDiagnosticLevel::Error);
+                    log::error!(
+                        "[byop-readiness] controller blocked request \
+                         category=DuplicateToolResults conversation_id={} \
+                         trigger_layer=controller_preflight request_attempt_id={} \
+                         iteration={iteration}",
+                        conversation_id_for_log,
+                        readiness_attempt_id
+                    );
+                    return Err(BlockedByopReadinessError::new(
+                        ReadinessCategory::DuplicateToolResults,
+                    )
+                    .into());
                 }
-                | crate::ai::byop_readiness::ReadinessState::OrphanToolResult { .. }
+                state @ (crate::ai::byop_readiness::ReadinessState::OrphanToolResult { .. }
                 | crate::ai::byop_readiness::ReadinessState::OutOfOrderToolResult { .. }
                 | crate::ai::byop_readiness::ReadinessState::MissingResultWithoutRepairSource {
                     ..
@@ -2400,7 +2459,48 @@ impl BlocklistAIController {
             let task_id = result.task_id.to_string();
             let tool_call_id = result.id.to_string();
             if self.has_persisted_tool_result(conversation_id, &task_id, &tool_call_id, ctx) {
-                continue;
+                // 修复并行 tool call 卡死 bug 的自愈路径:旧版 readiness 曾因 live key
+                // 三元组不匹配,给仍在执行的第 2+ 个并行调用合成过 preflight cancellation
+                // 占位;真实结果随后到达时,旧实现在这里直接 continue 把真实结果静默
+                // 丢弃,历史里留下假的"已取消"。若持久化的只是可精确识别的合成占位,
+                // 则删除占位让真实结果正常落地;真实结果(含真实 cancellation)仍跳过。
+                let synthetic_ids = self.byop_synthetic_cancellation_message_ids(
+                    conversation_id,
+                    &task_id,
+                    &tool_call_id,
+                    ctx,
+                );
+                if synthetic_ids.is_empty() {
+                    continue;
+                }
+                let task_id_for_remove = TaskId::new(task_id.clone());
+                let removed =
+                    BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                        history_model.remove_byop_preflight_messages_by_ids(
+                            conversation_id,
+                            task_id_for_remove,
+                            synthetic_ids,
+                            ctx,
+                        )
+                    });
+                match removed {
+                    Ok(count) if count > 0 => {
+                        log::info!(
+                            "[byop-readiness] replaced synthetic cancellation placeholder with \
+                             real tool result task_id={task_id} tool_call_id={tool_call_id} \
+                             removed={count}"
+                        );
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        log::error!(
+                            "[byop-readiness] failed to remove synthetic cancellation placeholder \
+                             task_id={task_id} tool_call_id={tool_call_id}: {e:#}; keeping \
+                             persisted result and dropping duplicate finished result"
+                        );
+                        continue;
+                    }
+                }
             }
             grouped_messages
                 .entry(result.task_id.clone())
@@ -2661,6 +2761,112 @@ impl BlocklistAIController {
             request_id: request_id.to_owned(),
             timestamp: None,
         }
+    }
+
+    /// 精确识别 [`Self::byop_synthetic_cancellation_message`] 合成的占位 message。
+    /// 校验三重特征:ToolCallResult 且 result oneof 为空、request_id 带 byop-preflight
+    /// 前缀、payload 恰为 `{"status":"cancelled","reason":"interrupted_by_user"}`。
+    /// 真实 committed cancellation(`byop_action_result_message`,payload 含 "result"
+    /// 字段)和本地拦截 payload(`_byop_intercepted`)都不会命中,保证自愈路径
+    /// 绝不误删真实历史。
+    fn is_byop_synthetic_cancellation_message(
+        msg: &warp_multi_agent_api::Message,
+        tool_call_id: &str,
+    ) -> bool {
+        let Some(message::Message::ToolCallResult(result)) = msg.message.as_ref() else {
+            return false;
+        };
+        if result.tool_call_id != tool_call_id || result.result.is_some() {
+            return false;
+        }
+        if !msg.request_id.starts_with("byop-preflight:") {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(msg.server_message_data.trim())
+        else {
+            return false;
+        };
+        value.get("status").and_then(serde_json::Value::as_str) == Some("cancelled")
+            && value.get("reason").and_then(serde_json::Value::as_str)
+                == Some("interrupted_by_user")
+            && value.get("result").is_none()
+            && value.len() == 2
+    }
+
+    /// 收集某 (task_id, tool_call_id) 下所有可精确识别的 preflight 合成 cancellation
+    /// 占位 message id(见 [`Self::is_byop_synthetic_cancellation_message`])。
+    fn byop_synthetic_cancellation_message_ids(
+        &self,
+        conversation_id: AIConversationId,
+        task_id: &str,
+        tool_call_id: &str,
+        ctx: &mut ModelContext<Self>,
+    ) -> HashSet<String> {
+        let task_id_owned = TaskId::new(task_id.to_owned());
+        BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .and_then(|conversation| conversation.get_task(&task_id_owned))
+            .map(|task| {
+                task.messages()
+                    .filter(|msg| Self::is_byop_synthetic_cancellation_message(msg, tool_call_id))
+                    .map(|msg| msg.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 修复并行 tool call 卡死 bug 的历史遗留自愈:readiness 判定
+    /// `DuplicateToolResults` 且重复结果中恰好存在"preflight 合成占位 + 真实结果"
+    /// 共存时,删除占位使对话解卡。只删除能被
+    /// [`Self::is_byop_synthetic_cancellation_message`] 精确识别的占位,且必须仍有
+    /// 至少一条真实持久化结果,否则不动历史(返回 0,由调用方按损坏历史阻断)。
+    fn remove_byop_synthetic_duplicate_result(
+        &self,
+        conversation_id: AIConversationId,
+        key: &crate::ai::byop_readiness::ToolCallKey,
+        results: &[crate::ai::byop_readiness::ToolResultRef],
+        ctx: &mut ModelContext<Self>,
+    ) -> anyhow::Result<usize> {
+        let persisted_ids: HashSet<&str> = results
+            .iter()
+            .filter(|result| result.source == ToolResultSource::PersistedHistory)
+            .map(|result| result.message_id.as_str())
+            .collect();
+        if persisted_ids.is_empty() {
+            return Ok(0);
+        }
+        let task_id_owned = TaskId::new(key.task_id.clone());
+        let Some(task) = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .and_then(|conversation| conversation.get_task(&task_id_owned))
+        else {
+            return Ok(0);
+        };
+        let mut synthetic_ids: HashSet<String> = HashSet::new();
+        let mut real_count = 0usize;
+        for msg in task.messages() {
+            if !persisted_ids.contains(msg.id.as_str()) {
+                continue;
+            }
+            if Self::is_byop_synthetic_cancellation_message(msg, &key.tool_call_id) {
+                synthetic_ids.insert(msg.id.clone());
+            } else {
+                real_count += 1;
+            }
+        }
+        if synthetic_ids.is_empty() || real_count == 0 {
+            return Ok(0);
+        }
+        BlocklistAIHistoryModel::handle(ctx)
+            .update(ctx, |history_model, ctx| {
+                history_model.remove_byop_preflight_messages_by_ids(
+                    conversation_id,
+                    task_id_owned,
+                    synthetic_ids,
+                    ctx,
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("failed to remove synthetic duplicate tool result: {e:#}"))
     }
 
     fn has_persisted_tool_result(

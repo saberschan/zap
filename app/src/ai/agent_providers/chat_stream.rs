@@ -6420,6 +6420,69 @@ mod serializer_readiness_tests {
         );
     }
 
+    /// 多工具调用轮回归(对话卡死 bug):真实历史里同一轮的每个 tool call 是独立
+    /// message(tool_call_message_a.id / tool_call_message_b.id)。controller 的 live
+    /// tool call 按各自 message id 建 key,而 readiness projection 把同轮调用合并到
+    /// 首条 message id 上。live 匹配若按三元组全等,第 2 个仍在运行的调用会被误判为
+    /// MissingResultWithoutRepairSource:controller 随即给运行中的调用合成假
+    /// cancellation,真实结果回来后 DuplicateToolResults 永久阻断对话。
+    #[test]
+    fn second_parallel_tool_call_running_with_own_message_id_is_pending_not_missing() {
+        let user_message = make_user_query_message("task-1", "req-1", "hi".to_owned(), &[]);
+        let tool_call_message_a = make_tool_call_message("task-1", "req-1", "call-1", shell_tool());
+        let tool_call_message_b = make_tool_call_message("task-1", "req-1", "call-2", shell_tool());
+        let tool_call_message_b_id = tool_call_message_b.id.clone();
+        let tool_result_message_a = make_tool_call_result_message(
+            "task-1",
+            "req-1",
+            "call-1".to_owned(),
+            r#"{"status":"completed"}"#.to_owned(),
+        );
+
+        let params = request_params(
+            vec![
+                user_message,
+                tool_call_message_a,
+                tool_call_message_b,
+                tool_result_message_a,
+            ],
+            vec![user_query_input("continue")],
+        );
+
+        // 修复前:call-2 的 live key 用 tool_call_message_b.id,与 projection 里合并
+        // group 的首条 message id 不一致,三元组匹配失败 → MissingResultWithoutRepairSource。
+        let blocked_report = classify_byop_controller_readiness(&params);
+        assert!(
+            matches!(
+                blocked_report.state,
+                ReadinessState::MissingResultWithoutRepairSource { .. }
+            ),
+            "call-2 has no result and no live entry → must be missing: {:?}",
+            blocked_report.state
+        );
+
+        // call-2 仍在运行(live key 用它自己的 message id)→ 必须等待,不能阻断。
+        let report = classify_byop_controller_readiness_with_live_tool_calls(
+            &params,
+            vec![LiveToolCall::new(
+                ToolCallRef::new(
+                    ToolCallKey::new("task-1", tool_call_message_b_id, "call-2"),
+                    kind(),
+                ),
+                LiveToolCallState::Running,
+            )],
+        );
+        assert!(
+            matches!(
+                report.state,
+                ReadinessState::PendingToolResults { ref tool_calls }
+                    if tool_calls.len() == 1 && tool_calls[0].key.tool_call_id == "call-2"
+            ),
+            "running second parallel call must be pending, got {:?}",
+            report.state
+        );
+    }
+
     #[test]
     fn controller_readiness_requires_cancellation_commit_before_user_boundary() {
         let tool_call_message = make_tool_call_message("task-1", "req-1", "call-1", shell_tool());
