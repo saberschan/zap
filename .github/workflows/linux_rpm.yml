@@ -65,7 +65,11 @@ jobs:
       - name: Compute build version tag
         id: version
         shell: bash
-        run: echo "tag=v0.$(date +%Y.%m.%d.%H%M)" >> "$GITHUB_OUTPUT"
+        # 版本形如 v2026.09.29.1147:剥掉 v 后的 2026.09.29.1147 与已发布版本
+        # (如 2026.07.09.1)同一命名空间,rpmvercmp 比较始终更新,`dnf upgrade`
+        # 能直接识别为升级;若带前导 0(如 v0.2026...)会被 dnf 判为旧版本,
+        # 安装时显示"降级"且 `dnf upgrade` 直接跳过。
+        run: echo "tag=v$(date +%Y.%m.%d.%H%M)" >> "$GITHUB_OUTPUT"
 
       # 一步完成编译 + 打包:cargo build (release-lto) → strip → staging → rpmbuild。
       # 产物落在 target/release-lto/bundle/linux/*.rpm。
