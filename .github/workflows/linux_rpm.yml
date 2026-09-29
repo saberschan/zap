@@ -1,0 +1,84 @@
+# Linux x86_64 RPM 精简打包流水线。
+#
+# 与 zap_release.yml(全平台 tag 发布)的差异:本 workflow 只做一件事 ——
+# 在 ubuntu-22.04 上编译 release-lto 二进制并打出 linux x64 RPM 包,
+# 上传为 workflow artifact。不构建 macOS / Windows / AppImage / deb / Arch / CLI,
+# 不创建 GitHub Release;push 到 main 或手动 dispatch 即触发。
+#
+# 版本号用 `v0.<构建时间>`:build.rs 与 bundle_rpm 都从 GIT_RELEASE_TAG 取版本
+# (`v` 前缀会被剥掉),日期时间格式保证跨构建单调递增,RPM 可直接升级安装。
+
+name: Linux x64 RPM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Zap fork 用 oss channel(app/src/bin/oss.rs 内联 ChannelConfig,
+  # 不依赖 warp-channel-config 私有二进制)。
+  CHANNEL: oss
+
+jobs:
+  build_rpm:
+    name: Build Linux x86_64 RPM
+    # 22.04 (glibc 2.35) 构建产物兼容更多旧发行版,与 zap_release.yml 一致。
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # GitHub-hosted ubuntu runner 预装工具链占用大量磁盘;release-lto 全量构建
+      # + 依赖编译会逼近磁盘上限,先删掉与本构建无关的工具腾出 ~25GB
+      # (与 zap_release.yml 的 release_linux job 相同处理)。
+      - name: Free up disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
+
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: linux
+          is_self_hosted: false
+          install_release_deps: true
+
+      # `rpm` 包提供 /usr/bin/rpmbuild;fakeroot 供打包 staging 使用;
+      # libdbus-1-dev 是 linux 构建的系统依赖(install_build_deps 未覆盖)。
+      - name: Install RPM build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev fakeroot rpm
+
+      - name: Ensure rust target is installed
+        shell: bash
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - name: Compute build version tag
+        id: version
+        shell: bash
+        run: echo "tag=v0.$(date +%Y.%m.%d.%H%M)" >> "$GITHUB_OUTPUT"
+
+      # 一步完成编译 + 打包:cargo build (release-lto) → strip → staging → rpmbuild。
+      # 产物落在 target/release-lto/bundle/linux/*.rpm。
+      - name: Build RPM package (linux x86_64)
+        shell: bash
+        run: script/bundle --channel "$CHANNEL" --arch x86_64 --packages rpm
+        env:
+          GIT_RELEASE_TAG: ${{ steps.version.outputs.tag }}
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zap-linux-x86_64-rpm
+          path: target/release-lto/bundle/linux/*.rpm
+          if-no-files-found: error
+          retention-days: 14
