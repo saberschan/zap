@@ -2790,7 +2790,7 @@ impl BlocklistAIController {
             && value.get("reason").and_then(serde_json::Value::as_str)
                 == Some("interrupted_by_user")
             && value.get("result").is_none()
-            && value.len() == 2
+            && value.as_object().is_some_and(|object| object.len() == 2)
     }
 
     /// 收集某 (task_id, tool_call_id) 下所有可精确识别的 preflight 合成 cancellation
