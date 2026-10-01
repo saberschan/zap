@@ -360,12 +360,20 @@ pub fn install_script(staging_tarball_path: Option<&str>) -> String {
 }
 
 /// 构造 Zap CLI release 资产下载基址。
+///
+/// fork / 本地构建的 GUI 运行远程安装脚本时,下载地址必须指向**自己**的
+/// Release 仓库:上游仓库没有 fork 版本号的 Release,按版本钉死的下载必然
+/// 404,远程连接会报 "install script failed"。编译期注入
+/// `ZAP_RELEASE_DOWNLOAD_BASE`(如 `https://github.com/<owner>/<repo>/releases`)
+/// 即可指向 fork;未设置时回退上游地址,官方构建行为不变。
 fn download_url() -> String {
+    let base = option_env!("ZAP_RELEASE_DOWNLOAD_BASE")
+        .unwrap_or("https://github.com/zerx-lab/warp/releases");
     let release_path = match ChannelState::app_version() {
         Some(tag) => format!("download/{tag}"),
         None => "latest/download".to_string(),
     };
-    format!("https://github.com/zerx-lab/warp/releases/{release_path}")
+    format!("{base}/{release_path}")
 }
 
 fn version_suffix() -> String {

@@ -83,6 +83,8 @@ jobs:
         run: script/bundle --channel "$CHANNEL" --arch x86_64 --packages rpm
         env:
           GIT_RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          # 远程安装脚本按此地址(本 fork 的 Release)下载 remote-server CLI。
+          ZAP_RELEASE_DOWNLOAD_BASE: https://github.com/saberschan/zap/releases
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -137,6 +139,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: 1
           USE_ZIGBUILD: "true"
           PKG_CONFIG_ALLOW_CROSS: 1
+          ZAP_RELEASE_DOWNLOAD_BASE: https://github.com/saberschan/zap/releases
 
       - name: Package CLI tarball
         run: |
